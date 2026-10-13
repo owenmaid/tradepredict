@@ -97,13 +97,44 @@ function analyze(closes: number[]) {
   };
 }
 
-async function fetchJson(url: string, init?: RequestInit) {
-  const res = await fetch(url, { ...init, signal: AbortSignal.timeout(12000) });
-  const text = await res.text();
-  let body: any = null;
-  try { body = text ? JSON.parse(text) : null; } catch { body = text; }
-  if (!res.ok) throw new Error(`IBKR ${res.status}: ${text.slice(0, 200)}`);
-  return body;
+const US_EXCHANGES = ['NASDAQ', 'NYSE', 'ARCA', 'AMEX', 'BATS', 'NYSE ARCA', 'NYSEAMERICAN'];
+const HISTORY_CONCURRENCY = 4; // IBKR allows 5 concurrent /marketdata/history requests
+const SEARCH_CONCURRENCY = 3; // stay well under IBKR's ~10 req/s global limit
+
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+// Runs `fn` over `items` with at most `limit` calls in flight.
+async function mapLimit<T, R>(items: T[], limit: number, fn: (item: T) => Promise<R>): Promise<R[]> {
+  const out: R[] = new Array(items.length);
+  let next = 0;
+  const worker = async () => {
+    while (next < items.length) {
+      const i = next++;
+      out[i] = await fn(items[i]);
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(limit, items.length) }, worker));
+  return out;
+}
+
+function makeIbkr(base: string, apiKey: string) {
+  // Calls the TradePredict bridge, which forwards to IBKR. Retries on rate limiting (429).
+  return async function ibkr(path: string, attempt = 0): Promise<any> {
+    const res = await fetch(`${base}/v1/api/${path}`, {
+      headers: { 'x-api-key': apiKey, Accept: 'application/json' },
+      signal: AbortSignal.timeout(15000)
+    });
+    const text = await res.text();
+    let body: any = null;
+    try { body = text ? JSON.parse(text) : null; } catch { body = text; }
+    if (res.status === 429 && attempt < 2) {
+      await sleep(1500 * (attempt + 1));
+      return ibkr(path, attempt + 1);
+    }
+    if (res.status === 401) throw new Error('Bridge rejected the API key. Check that IBKR_BRIDGE_KEY matches BRIDGE_API_KEY on the bridge.');
+    if (!res.ok) throw new Error(`IBKR ${res.status}: ${String(body?.error ?? text).slice(0, 200)}`);
+    return body;
+  };
 }
 
 export default async function(req: Request): Promise<Response> {
@@ -112,71 +143,106 @@ export default async function(req: Request): Promise<Response> {
     const user = await base44.auth.me();
     if (!user) return Response.json({ error: 'Unauthorized' }, { status: 401 });
 
-    const gateway = secrets.get('IBKR_GATEWAY_URL');
-    if (!gateway) {
+    const bridgeUrl = secrets.get('IBKR_BRIDGE_URL');
+    const bridgeKey = secrets.get('IBKR_BRIDGE_KEY');
+    if (!bridgeUrl || !bridgeKey) {
       return Response.json({
         configured: false,
-        message: 'IBKR gateway not configured. Add IBKR_GATEWAY_URL in the app dashboard Secrets (the base URL of your running, authenticated IBKR Client Portal Gateway, e.g. https://your-host:5000).'
+        message: 'IBKR bridge not configured. Deploy the service in the /bridge folder of this repo, then add IBKR_BRIDGE_URL and IBKR_BRIDGE_KEY in the app dashboard Secrets. (Calling the Client Portal Gateway directly is no longer supported because it exposes your brokerage session without authentication.)'
       });
+    }
+    if (!bridgeUrl.startsWith('https://')) {
+      return Response.json({ configured: false, message: 'IBKR_BRIDGE_URL must start with https:// so the API key is never sent in clear text.' });
     }
 
     const body = await req.json().catch(() => ({}));
     const screenId: string = body.screen && SCREENS[body.screen] ? body.screen : 'mega_tech';
     const screen = SCREENS[screenId];
-    const base = gateway.replace(/\/$/, '');
+    const ibkr = makeIbkr(bridgeUrl.replace(/\/$/, ''), bridgeKey);
+    const skipped: { symbol: string; reason: string }[] = [];
 
-    // 1. Confirm the gateway session is authenticated.
+    // 1. Confirm the IBKR session is authenticated.
     try {
-      const status = await fetchJson(`${base}/v1/api/iserver/auth/status`);
+      const status = await ibkr('iserver/auth/status');
       if (status && status.authenticated === false) {
         return Response.json({
           configured: true,
           authenticated: false,
-          message: 'IBKR gateway is reachable but not authenticated. Complete the 2FA login in the IBKR Client Portal Gateway, then re-run the screen.'
+          message: 'The bridge is reachable but its IBKR session is not authenticated. With OAuth, check the bridge logs; with the Client Portal Gateway, complete the 2FA login, then re-run the screen.'
         });
       }
     } catch (e) {
-      return Response.json({ configured: true, reachable: false, message: `Could not reach the IBKR gateway at ${base}: ${(e as Error).message}` });
+      return Response.json({ configured: true, reachable: false, message: `Could not reach the IBKR bridge: ${(e as Error).message}` });
     }
 
-    // 2. Resolve each ticker to an IBKR conid.
-    const resolveOne = async (ticker: string) => {
-      try {
-        const data = await fetchJson(`${base}/v1/api/iserver/secdef/search?symbol=${encodeURIComponent(ticker)}&name=true&secType=STK`);
-        const list = Array.isArray(data) ? data : data?.data ?? [];
-        const hit = list.find((c: any) => c.conid) || list[0];
-        return hit ? { ticker, conid: String(hit.conid), company: hit.companyName ?? hit.name ?? ticker } : null;
-      } catch { return null; }
-    };
-    const resolved = (await Promise.all(screen.tickers.map(resolveOne))).filter(Boolean) as { ticker: string; conid: string; company: string }[];
+    // IBKR expects /iserver/accounts once per session before market-data calls work reliably.
+    await ibkr('iserver/accounts').catch(() => null);
 
-    // 3. Fetch daily history for each conid, in batches of 6.
-    const fetchHistory = async (conid: string) => {
+    // 2. Resolve tickers to US stock contract ids in one call.
+    type Resolved = { ticker: string; conid: string; company: string };
+    const resolved: Resolved[] = [];
+    let stocks: Record<string, any[]> = {};
+    try {
+      stocks = (await ibkr(`trsrv/stocks?symbols=${encodeURIComponent(screen.tickers.join(','))}`)) ?? {};
+    } catch { stocks = {}; }
+
+    const unresolved: string[] = [];
+    for (const ticker of screen.tickers) {
+      const entries: any[] = stocks[ticker] ?? [];
+      let match: Resolved | null = null;
+      for (const entry of entries) {
+        if (entry.assetClass && entry.assetClass !== 'STK') continue;
+        const contract = (entry.contracts ?? []).find((c: any) => c.isUS && c.conid);
+        if (contract) { match = { ticker, conid: String(contract.conid), company: entry.name ?? ticker }; break; }
+      }
+      if (match) resolved.push(match); else unresolved.push(ticker);
+    }
+
+    // Fallback: symbol search (by ticker, not company name), throttled.
+    const fallback = await mapLimit(unresolved, SEARCH_CONCURRENCY, async (ticker) => {
       try {
-        const data = await fetchJson(`${base}/v1/api/iserver/marketdata/history?conid=${conid}&period=6m&bar=1d&outsideRth=true`);
+        const data = await ibkr(`iserver/secdef/search?symbol=${encodeURIComponent(ticker)}&secType=STK`);
+        const list: any[] = Array.isArray(data) ? data : data?.data ?? [];
+        const exact = list.filter((c) => c.conid && String(c.symbol ?? ticker).toUpperCase() === ticker);
+        const hit = exact.find((c) => US_EXCHANGES.includes(String(c.description ?? '').toUpperCase())) ?? exact[0];
+        if (!hit) { skipped.push({ symbol: ticker, reason: 'No US stock contract found' }); return null; }
+        return { ticker, conid: String(hit.conid), company: hit.companyName ?? ticker };
+      } catch (e) {
+        skipped.push({ symbol: ticker, reason: `Lookup failed: ${(e as Error).message}` });
+        return null;
+      }
+    });
+    for (const r of fallback) if (r) resolved.push(r);
+
+    // 3. Fetch daily history, never more than HISTORY_CONCURRENCY at once.
+    const histories = await mapLimit(resolved, HISTORY_CONCURRENCY, async (r) => {
+      try {
+        const data = await ibkr(`iserver/marketdata/history?conid=${r.conid}&period=6m&bar=1d&outsideRth=true`);
         const bars: any[] = data?.data ?? [];
         return bars.map((b) => ({ t: b.t, c: b.c })).filter((b) => typeof b.c === 'number');
-      } catch { return []; }
-    };
+      } catch (e) {
+        skipped.push({ symbol: r.ticker, reason: `History failed: ${(e as Error).message}` });
+        return null;
+      }
+    });
 
     const results: any[] = [];
-    for (let i = 0; i < resolved.length; i += 6) {
-      const batch = resolved.slice(i, i + 6);
-      const histories = await Promise.all(batch.map((r) => fetchHistory(r.conid)));
-      histories.forEach((h, idx) => {
-        const r = batch[idx];
-        if (h.length < 30) return; // not enough data to score
-        const closes = h.map((b) => b.c);
-        const a = analyze(closes);
-        results.push({
-          symbol: r.ticker,
-          conid: r.conid,
-          company: r.company,
-          ...a,
-          history: h.slice(-60)
-        });
+    histories.forEach((h, idx) => {
+      const r = resolved[idx];
+      if (!h) return;
+      if (h.length < 30) {
+        skipped.push({ symbol: r.ticker, reason: `Only ${h.length} days of history (need 30+)` });
+        return;
+      }
+      const closes = h.map((b) => b.c);
+      results.push({
+        symbol: r.ticker,
+        conid: r.conid,
+        company: r.company,
+        ...analyze(closes),
+        history: h.slice(-60)
       });
-    }
+    });
 
     results.sort((a, b) => b.score - a.score);
 
@@ -228,6 +294,7 @@ Return JSON with an "analyses" array, one entry per symbol.`;
       runAt: new Date().toISOString(),
       count: finalResults.length,
       results: finalResults,
+      skipped,
       disclaimer: 'Educational tool only. Scores are a technical heuristic, not investment advice.'
     });
   } catch (error) {

@@ -29,9 +29,11 @@ export default function Home() {
         setError(data.message);
       } else {
         setResults(data.results || []);
-        setMeta({ screenLabel: data.screenLabel, runAt: data.runAt, count: data.count });
-        if ((data.results || []).length === 0) {
-          setError("No scored results came back. Check that your IBKR account has a market-data subscription and the gateway session is authenticated.");
+        setMeta({ screenLabel: data.screenLabel, runAt: data.runAt, count: data.count, skipped: data.skipped || [] });
+        if ((data.results || []).length === 0 && (data.skipped || []).length > 0) {
+          setError(`No shares could be scored. First problem: ${data.skipped[0].symbol} — ${data.skipped[0].reason}`);
+        } else if ((data.results || []).length === 0) {
+          setError("No scored results came back. Check that your IBKR account has market-data subscriptions for these exchanges and that the bridge's IBKR session is authenticated.");
         }
       }
     } catch (e) {
@@ -96,6 +98,20 @@ export default function Home() {
                 <span className="text-xs text-muted-foreground">Updated {new Date(meta.runAt).toLocaleString()}</span>
               )}
             </div>
+            {meta?.skipped?.length > 0 && (
+              <details className="rounded-lg border border-border bg-muted/40 px-3 py-2 text-xs text-muted-foreground">
+                <summary className="cursor-pointer select-none">
+                  {meta.skipped.length} {meta.skipped.length === 1 ? "share" : "shares"} could not be scored
+                </summary>
+                <ul className="mt-2 space-y-1">
+                  {meta.skipped.map((s) => (
+                    <li key={s.symbol}>
+                      <span className="font-medium text-foreground">{s.symbol}</span> — {s.reason}
+                    </li>
+                  ))}
+                </ul>
+              </details>
+            )}
             {results.map((s, idx) => (
               <StockRow key={s.conid || s.symbol} stock={s} rank={idx + 1} onClick={() => setSelected(s)} />
             ))}
